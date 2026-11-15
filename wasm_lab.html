@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WASM Lab - manual sample driver</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#14161a; color:#d7dae0; font:14px/1.5 ui-monospace,Menlo,Consolas,monospace;
+         margin:0; padding:24px; }
+  h1 { font-size:16px; letter-spacing:.08em; text-transform:uppercase; color:#e05252; margin:0 0 4px; }
+  .sub { color:#6b7280; margin-bottom:20px; font-size:12px; }
+  .panel { border:1px solid #2a2f37; border-radius:6px; padding:14px 16px; margin-bottom:14px; background:#181b20; }
+  .panel h2 { font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:#8b94a3;
+              margin:0 0 10px; font-weight:600; }
+  button { background:#232830; color:#d7dae0; border:1px solid #39404b; border-radius:4px;
+           padding:6px 12px; font:inherit; font-size:13px; cursor:pointer; margin:0 6px 6px 0; }
+  button:hover:not(:disabled) { background:#2d333d; border-color:#4a5563; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  input[type=file] { font:inherit; font-size:13px; }
+  #log { white-space:pre-wrap; word-break:break-all; max-height:380px; overflow:auto;
+         background:#0f1115; border:1px solid #2a2f37; border-radius:4px; padding:10px; font-size:12.5px; }
+  .ok{color:#5fb85f} .warn{color:#d9a441} .err{color:#e05252} .dim{color:#6b7280} .hi{color:#6aa9e0}
+  table { border-collapse:collapse; font-size:12.5px; width:100%; }
+  td,th { text-align:left; padding:3px 14px 3px 0; border-bottom:1px solid #22262d; }
+  th { color:#8b94a3; font-weight:600; }
+  .stat { display:inline-block; margin-right:22px; }
+  .stat b { color:#6aa9e0; font-weight:600; }
+</style>
+</head>
+<body>
+<h1>WASM Lab</h1>
+<div class="sub">Loads a module from disk, stubs every import, and lets you invoke exports by hand.
+No server needed &mdash; open this file directly and pick the .wasm.</div>
+
+<div class="panel">
+  <h2>Sample</h2>
+  <input type="file" id="file" accept=".wasm,application/wasm">
+  <button id="btnInst" disabled>Stub imports &amp; instantiate</button>
+  <button id="btnCN" disabled>Run cryptonight sequence</button>
+  <button id="btnAll" disabled>Call every export</button>
+  <button id="btnClear">Clear log</button>
+</div>
+
+<div class="panel"><h2>Module</h2><div id="meta" class="dim">No file loaded.</div></div>
+<div class="panel"><h2>Exports</h2><div id="exports" class="dim">&mdash;</div></div>
+<div class="panel"><h2>Runtime</h2>
+  <div id="stats" class="dim">&mdash;</div>
+  <div id="log"></div>
+</div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+function log(msg, cls) {
+  const s = document.createElement('span');
+  if (cls) s.className = cls;
+  s.textContent = msg + '\n';
+  logEl.appendChild(s);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+let bytes = null, mod = null, instance = null;
+let memory = null, table = null, memPages = 256, tableSize = 4096;
+const GTYPES = ['i32', 'f64', 'f32', 'i64'];
+const gidx = {};
+const hostCalls = new Map();
+
+function gtype(key, name) {
+  if (!(key in gidx)) gidx[key] = /NaN|Infinity|tempDoublePtr/i.test(name) ? 1 : 0;
+  return GTYPES[gidx[key]];
+}
+
+function buildImports() {
+  if (!memory) memory = new WebAssembly.Memory({initial: memPages, maximum: 32768});
+  if (!table)  table  = new WebAssembly.Table({initial: tableSize, element: 'anyfunc'});
+  const o = {};
+  for (const imp of WebAssembly.Module.imports(mod)) {
+    const key = imp.module + '.' + imp.name;
+    o[imp.module] = o[imp.module] || {};
+    if (imp.kind === 'memory') { o[imp.module][imp.name] = memory; continue; }
+    if (imp.kind === 'table')  { o[imp.module][imp.name] = table;  continue; }
+    if (imp.kind === 'global') {
+      const t = gtype(key, imp.name);
+      o[imp.module][imp.name] = new WebAssembly.Global({value:t, mutable:false}, t==='i64'?0n:0);
+      continue;
+    }
+    o[imp.module][imp.name] = function (...args) {
+      hostCalls.set(key, (hostCalls.get(key) || 0) + 1);
+      if (/resize_heap|enlargeMemory|grow/i.test(imp.name)) {
+        try {
+          const want = args[0] | 0, have = memory.buffer.byteLength;
+          if (want > have) memory.grow(Math.ceil((want - have) / 65536));
+          return 1;
+        } catch (e) { return 0; }
+      }
+      if (/getTotalMemory|get_heap_size/i.test(imp.name)) return memory.buffer.byteLength;
+      if (/memcpy/i.test(imp.name) && args.length >= 3) {
+        try { new Uint8Array(memory.buffer).copyWithin(args[0], args[1], args[1]+args[2]); } catch(e){}
+        return args[0];
+      }
+      return 0;
+    };
+  }
+  return o;
+}
+
+function refreshStats() {
+  const pages = memory ? memory.buffer.byteLength / 65536 : 0;
+  const calls = [...hostCalls.entries()].sort((a,b)=>b[1]-a[1])
+                 .map(([k,v]) => `${k}&times;${v}`).join('  ') || 'none';
+  $('stats').innerHTML =
+    `<span class="stat">memory <b>${pages}</b> pages (${(pages/16).toFixed(1)} MiB)</span>` +
+    `<span class="stat">host calls <b>${[...hostCalls.values()].reduce((a,b)=>a+b,0)}</b></span>` +
+    `<div class="dim" style="margin-top:6px">${calls}</div>`;
+}
+
+$('file').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  bytes = new Uint8Array(await f.arrayBuffer());
+  try { mod = new WebAssembly.Module(bytes); }
+  catch (err) { log('compile failed: ' + err.message, 'err'); return; }
+  instance = null; memory = null; table = null; hostCalls.clear();
+  const imps = WebAssembly.Module.imports(mod), exps = WebAssembly.Module.exports(mod);
+  const kinds = {};
+  for (const i of imps) kinds[i.kind] = (kinds[i.kind]||0)+1;
+  $('meta').innerHTML =
+    `<div><b class="hi">${f.name}</b> &mdash; ${bytes.length.toLocaleString()} bytes</div>` +
+    `<div class="dim">${imps.length} imports (` +
+    Object.entries(kinds).map(([k,v])=>`${v} ${k}`).join(', ') +
+    `), ${exps.length} exports</div>` +
+    `<table><tr><th>import</th><th>kind</th></tr>` +
+    imps.map(i=>`<tr><td>${i.module}.${i.name}</td><td class="dim">${i.kind}</td></tr>`).join('') +
+    `</table>`;
+  $('exports').textContent = exps.map(e=>`${e.kind}  ${e.name}`).join('\n');
+  $('btnInst').disabled = false;
+  log('loaded ' + f.name, 'ok');
+});
+
+$('btnInst').addEventListener('click', () => {
+  instance = null;
+  for (let i = 0; i < 24 && !instance; i++) {
+    try { instance = new WebAssembly.Instance(mod, buildImports()); }
+    catch (err) {
+      if (!(err instanceof WebAssembly.LinkError)) { log('error: ' + err.message, 'err'); return; }
+      const gk = Object.keys(gidx).find(k => err.message.includes(k.split('.').pop()));
+      if (/memory/i.test(err.message) && memPages < 32768) {
+        memPages = Math.min(memPages*2, 32768); memory = null;
+        log('memory too small, retrying with ' + memPages + ' pages', 'warn');
+      } else if (/table/i.test(err.message) && tableSize < (1<<20)) {
+        tableSize *= 4; table = null;
+        log('table too small, retrying with ' + tableSize + ' entries', 'warn');
+      } else if (gk && gidx[gk]+1 < GTYPES.length) {
+        gidx[gk]++; log('global ' + gk + ' -> ' + gtype(gk, gk), 'warn');
+      } else { log('LinkError: ' + err.message, 'err'); return; }
+    }
+  }
+  if (!memory && instance.exports.memory instanceof WebAssembly.Memory)
+    memory = instance.exports.memory;
+  log('instantiated', 'ok');
+  $('btnCN').disabled = $('btnAll').disabled = false;
+  renderExportButtons();
+  refreshStats();
+});
+
+function call(name, args) {
+  const fn = instance.exports[name];
+  const t0 = performance.now();
+  try {
+    const r = fn(...args);
+    const dt = performance.now() - t0;
+    log(`${name}(${args.join(', ')}) -> ${r}   ${dt.toFixed(2)} ms`,
+        dt > 5 ? 'ok' : null);
+    return r;
+  } catch (e) {
+    log(`${name}(${args.join(', ')}) threw: ${e.message}`, 'err');
+  } finally { refreshStats(); }
+}
+
+function renderExportButtons() {
+  const host = $('exports');
+  host.textContent = '';
+  for (const e of WebAssembly.Module.exports(mod)) {
+    if (e.kind !== 'function') continue;
+    const n = instance.exports[e.name].length;
+    const b = document.createElement('button');
+    b.textContent = `${e.name}(${n})`;
+    b.onclick = () => call(e.name, new Array(n).fill(0));
+    host.appendChild(b);
+  }
+}
+
+function hexdump(addr, len) {
+  const u8 = new Uint8Array(memory.buffer);
+  let out = '';
+  for (let o = 0; o < len; o += 16) {
+    const row = [...u8.slice(addr+o, addr+o+16)];
+    out += (addr+o).toString(16).padStart(8,'0') + '  ' +
+           row.map(b=>b.toString(16).padStart(2,'0')).join(' ').padEnd(47) + '  ' +
+           row.map(b=> b>=32&&b<127 ? String.fromCharCode(b) : '.').join('') + '\n';
+  }
+  log(out);
+}
+
+$('btnCN').addEventListener('click', () => {
+  const ex = instance.exports, has = (n) => typeof ex[n] === 'function';
+  if (!has('_cryptonight_hash')) { log('no _cryptonight_hash export', 'warn'); return; }
+  const ctx = has('_cryptonight_create') ? call('_cryptonight_create', []) : 0;
+  let inp = 0x100000, out = 0x200000;
+  if (has('_malloc')) {
+    const a = call('_malloc',[76]), b = call('_malloc',[32]);
+    if (a && b && a !== b) { inp = a; out = b; }
+    else log('malloc unusable, using fixed scratch addresses', 'warn');
+  }
+  const u8 = new Uint8Array(memory.buffer);
+  for (let i = 0; i < 76; i++) u8[inp+i] = (i*7+3) & 0xff;
+  const n = ex._cryptonight_hash.length;
+  const orders = n===4 ? [[ctx,inp,out,76],[inp,out,76,ctx],[ctx,inp,76,out]]
+               : n===3 ? [[inp,out,76],[ctx,inp,out]] : [[inp,out]];
+  const before = [...new Uint8Array(memory.buffer).slice(out,out+32)].join(',');
+  for (const args of orders) {
+    call('_cryptonight_hash', args);
+    if ([...new Uint8Array(memory.buffer).slice(out,out+32)].join(',') !== before) {
+      log('output changed - this argument order is correct', 'ok'); break;
+    }
+    log('output unchanged, trying next order', 'dim');
+  }
+  log('digest buffer @ 0x' + out.toString(16) + ':');
+  hexdump(out, 32);
+  if (has('_cryptonight_destroy')) call('_cryptonight_destroy',[ctx]);
+});
+
+$('btnAll').addEventListener('click', () => {
+  for (const e of WebAssembly.Module.exports(mod)) {
+    if (e.kind !== 'function') continue;
+    call(e.name, new Array(instance.exports[e.name].length).fill(0));
+  }
+});
+
+$('btnClear').addEventListener('click', () => { logEl.textContent = ''; });
+</script>
+</body>
+</html>
